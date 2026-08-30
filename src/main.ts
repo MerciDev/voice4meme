@@ -7,81 +7,75 @@ import { defaultScenes } from './data';
 import { VideoController, getYouTubeId, ytApiReady } from './video';
 
 // --- Global Data (LocalStorage merged) ---
-function loadScenes(): Scene[] {
-  let loaded = [...defaultScenes];
-  
-  const delStr = localStorage.getItem('voiceme_deleted_scenes');
-  if (delStr) {
-    try {
-      const deletedIds: string[] = JSON.parse(delStr);
-      loaded = loaded.filter(s => !deletedIds.includes(s.id));
-    } catch (e) {}
-  }
-
-  const localStr = localStorage.getItem('voiceme_scenes');
-  if (localStr) {
-    try {
-      const localScenes: Scene[] = JSON.parse(localStr);
-      localScenes.forEach(ls => {
-        const idx = loaded.findIndex(s => s.id === ls.id);
-        if (idx >= 0) loaded[idx] = ls;
-        else loaded.push(ls);
-      });
-    } catch (e) {}
-  }
-  return loaded;
-}
-
-function saveLocalScene(scene: Scene) {
-  const localStr = localStorage.getItem('voiceme_scenes');
-  let localScenes: Scene[] = [];
-  if (localStr) {
-    try { localScenes = JSON.parse(localStr); } catch (e) {}
-  }
-  
-  const idx = localScenes.findIndex(s => s.id === scene.id);
-  if (idx >= 0) localScenes[idx] = scene;
-  else localScenes.push(scene);
-  
-  localStorage.setItem('voiceme_scenes', JSON.stringify(localScenes));
-  scenes = loadScenes();
-}
-
-function deleteGlobalScene(id: string) {
-  // Check if it's a local scene
-  const localStr = localStorage.getItem('voiceme_scenes');
-  let localScenes: Scene[] = [];
-  if (localStr) {
-    try { localScenes = JSON.parse(localStr); } catch (e) {}
-  }
-  const isLocal = localScenes.some(s => s.id === id);
-  if (isLocal) {
-    localScenes = localScenes.filter(s => s.id !== id);
-    localStorage.setItem('voiceme_scenes', JSON.stringify(localScenes));
-  }
-  
-  // Check if it's a default scene, mark as deleted
-  const isDefault = defaultScenes.some(s => s.id === id);
-  if (isDefault) {
-    const delStr = localStorage.getItem('voiceme_deleted_scenes');
-    let deletedIds: string[] = [];
-    if (delStr) {
-      try { deletedIds = JSON.parse(delStr); } catch (e) {}
-    }
-    deletedIds.push(id);
-    localStorage.setItem('voiceme_deleted_scenes', JSON.stringify(deletedIds));
-  }
-  
-  scenes = loadScenes();
-}
-
-
 const SUPABASE_URL = 'https://ltnunwzhlpviojsajdxi.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_HoX6FdKwrAp7zJVYZFTR8w_Uw2nC6VN';
 export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 let roomChannel: RealtimeChannel | null = null;
-let scenes: Scene[] = loadScenes();
+let scenes: Scene[] = [...defaultScenes];
+
+async function loadScenes() {
+  try {
+    const { data, error } = await supabase.from('scenes').select('data');
+    if (error) throw error;
+    
+    if (data && data.length > 0) {
+      const dbScenes = data.map(row => row.data as Scene);
+      
+      let loaded = [...defaultScenes];
+      dbScenes.forEach(dbS => {
+        const idx = loaded.findIndex(s => s.id === dbS.id);
+        if (idx >= 0) loaded[idx] = dbS;
+        else loaded.push(dbS);
+      });
+      scenes = loaded;
+    } else {
+      // Si la base de datos está vacía, subimos las escenas por defecto
+      console.log('Base de datos vacía, inicializando con escenas por defecto...');
+      const insertData = defaultScenes.map(s => ({
+        id: s.id,
+        title: s.title,
+        data: s
+      }));
+      await supabase.from('scenes').insert(insertData);
+      scenes = [...defaultScenes];
+    }
+  } catch (err) {
+    console.error('Error fetching scenes from Supabase:', err);
+  }
+}
+// Load scenes on init
+loadScenes();
+
+async function saveGlobalScene(scene: Scene) {
+  try {
+    const { error } = await supabase.from('scenes').upsert({
+      id: scene.id,
+      title: scene.title,
+      data: scene
+    });
+    if (error) throw error;
+    
+    const idx = scenes.findIndex(s => s.id === scene.id);
+    if (idx >= 0) scenes[idx] = scene;
+    else scenes.push(scene);
+  } catch (err) {
+    console.error('Error saving scene to Supabase:', err);
+    throw err;
+  }
+}
+
+async function deleteGlobalScene(id: string) {
+  try {
+    const { error } = await supabase.from('scenes').delete().eq('id', id);
+    if (error) throw error;
+    
+    scenes = scenes.filter(s => s.id !== id);
+  } catch (err) {
+    console.error('Error deleting scene from Supabase:', err);
+    throw err;
+  }
+}
 
 // --- State ---
 let recordedTracks: RecordedTrack[] = [];
@@ -213,9 +207,9 @@ btnAdminCreate.addEventListener('click', () => {
   showView('view-editor');
 });
 
-window.removeAdminScene = (id: string) => {
+window.removeAdminScene = async (id: string) => {
   if (confirm("¿Seguro que quieres borrar esta escena?")) {
-    deleteGlobalScene(id);
+    await deleteGlobalScene(id);
     renderAdminLibrary();
   }
 };
@@ -351,7 +345,7 @@ const editorVideoUrl = document.getElementById('editor-video-url') as HTMLInputE
 const editorBackgroundUrl = document.getElementById('editor-background-url') as HTMLInputElement;
 const editorVideoUpload = document.getElementById('editor-video-upload') as HTMLInputElement;
 const editorAudioUpload = document.getElementById('editor-audio-upload') as HTMLInputElement;
-const btnYtImport = document.getElementById('btn-yt-import') as HTMLButtonElement;
+const btnExtract = document.getElementById('btn-extract') as HTMLButtonElement;
 const editorImportSrt = document.getElementById('editor-import-srt') as HTMLInputElement;
 const btnLoadVideo = document.getElementById('btn-load-video')!;
 const editorCharList = document.getElementById('editor-char-list')!;
@@ -1022,61 +1016,20 @@ btnMultiMerge.addEventListener('click', () => {
   handleDialogueSelection(firstD.id, false);
 });
 
-async function uploadToCatbox(file: File, labelElement?: HTMLElement): Promise<string> {
-  const originalText = labelElement ? labelElement.innerText : '';
-  if (labelElement) labelElement.innerText = 'Subiendo...';
-  
-  const formData = new FormData();
-  formData.append('reqtype', 'fileupload');
-  formData.append('fileToUpload', file);
-  
-  try {
-    const res = await fetch('https://catbox.moe/user/api.php', {
-      method: 'POST',
-      body: formData,
-    });
-    if (!res.ok) throw new Error('Error al subir a Catbox');
-    return await res.text();
-  } catch (error) {
-    console.error(error);
-    alert('Error al subir el archivo. Revisa la consola o intenta de nuevo.');
-    throw error;
-  } finally {
-    if (labelElement) labelElement.innerText = originalText;
-  }
-}
+// Removed Catbox Upload functions
 
-if (editorVideoUpload) {
-  editorVideoUpload.addEventListener('change', async (e) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
-    if (!file) return;
-    try {
-      const url = await uploadToCatbox(file, editorVideoUpload.parentElement as HTMLElement);
-      editorVideoUrl.value = url;
-      btnLoadVideo.click();
-    } catch (err) {}
-  });
-}
+if (btnExtract) {
+  btnExtract.addEventListener('click', async () => {
+    let targetUrl = editorVideoUrl.value.trim();
+    if (!targetUrl) {
+      targetUrl = prompt('Pega el enlace de Streamable, YouTube, etc. aquí:') || '';
+      if (!targetUrl) return;
+      editorVideoUrl.value = targetUrl;
+    }
 
-if (editorAudioUpload) {
-  editorAudioUpload.addEventListener('change', async (e) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
-    if (!file) return;
-    try {
-      const url = await uploadToCatbox(file, editorAudioUpload.parentElement as HTMLElement);
-      editorBackgroundUrl.value = url;
-    } catch (err) {}
-  });
-}
-
-if (btnYtImport) {
-  btnYtImport.addEventListener('click', async () => {
-    const ytUrl = prompt('Pega el enlace de YouTube aquí (ej. https://youtu.be/...):');
-    if (!ytUrl) return;
-
-    const originalText = btnYtImport.innerText;
-    btnYtImport.innerText = 'Obteniendo...';
-    btnYtImport.disabled = true;
+    const originalText = btnExtract.innerText;
+    btnExtract.innerText = 'Extrayendo...';
+    btnExtract.disabled = true;
 
     try {
       // 1. Obtener enlace directo de Cobalt
@@ -1086,40 +1039,25 @@ if (btnYtImport) {
           'Accept': 'application/json',
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ url: ytUrl, videoQuality: '720' })
+        body: JSON.stringify({ url: targetUrl, videoQuality: '720' })
       });
       if (!cobaltRes.ok) throw new Error('Error al conectar con Cobalt');
       
       const cobaltData = await cobaltRes.json();
       if (cobaltData.status !== 'redirect' && cobaltData.status !== 'stream' && cobaltData.status !== 'success') {
-        throw new Error('No se pudo obtener el vídeo de YouTube');
+        throw new Error('No se pudo obtener el vídeo de la URL proporcionada');
       }
       const directUrl = cobaltData.url;
 
-      btnYtImport.innerText = 'Subiendo a Catbox...';
-
-      // 2. Usar 'urlupload' de Catbox para que descarguen el vídeo directamente sin gastar los datos del usuario
-      const formData = new FormData();
-      formData.append('reqtype', 'urlupload');
-      formData.append('url', directUrl);
-
-      const catboxRes = await fetch('https://catbox.moe/user/api.php', {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!catboxRes.ok) throw new Error('Error al subir a Catbox');
-      const finalUrl = await catboxRes.text();
-
-      // 3. Poner la URL final y cargar el vídeo automáticamente
-      editorVideoUrl.value = finalUrl;
+      // 2. Usar la URL directa obtenida por Cobalt
+      editorVideoUrl.value = directUrl;
       btnLoadVideo.click();
     } catch (err: any) {
       console.error(err);
-      alert('Error al importar de YouTube: ' + err.message);
+      alert('Error al extraer el vídeo: ' + err.message);
     } finally {
-      btnYtImport.innerText = originalText;
-      btnYtImport.disabled = false;
+      btnExtract.innerText = originalText;
+      btnExtract.disabled = false;
     }
   });
 }
@@ -1433,10 +1371,13 @@ btnSaveScene.addEventListener('click', () => {
     alert("La escena necesita video, al menos 1 personaje y 1 diálogo.");
     return;
   }
-  saveLocalScene(newScene);
-  alert("¡Escena guardada con éxito!");
-  editorVidCtrl.destroy();
-  renderAdminLibrary();
+  saveGlobalScene(newScene).then(() => {
+    alert("¡Escena guardada con éxito en la nube!");
+    editorVidCtrl.destroy();
+    renderAdminLibrary();
+  }).catch(() => {
+    alert("Error al guardar la escena en la nube.");
+  });
 });
 
 btnExitEditor.addEventListener('click', () => {
